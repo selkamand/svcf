@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
 use noodles::vcf;
+use noodles::vcf::io::CompressionMethod;
 use noodles::vcf::variant::record::AlternateBases;
 use noodles::vcf::variant::record::Filters;
 use noodles::vcf::variant::record::Ids;
@@ -307,9 +308,19 @@ impl StructuralVariants {
 /// Returns an error if the VCF cannot be opened or parsed, if required fields
 /// are missing or malformed, or if breakend pairing encounters invalid IDs.
 pub fn vcf_to_structural_variants(vcf: &str, vaf_field: &str) -> Result<StructuralVariants> {
-    let mut reader = File::open(vcf)
-        .map(BufReader::new)
-        .map(noodles::vcf::io::Reader::new)?;
+    let compression_method = match vcf.ends_with(".gz") {
+        true => CompressionMethod::Bgzf,
+        false => CompressionMethod::None,
+    };
+    let mut reader = vcf::io::reader::Builder::default()
+        .set_compression_method(compression_method)
+        .build_from_path(vcf)
+        .context("Failed to read vcf")?;
+
+    // let mut reader = File::open(vcf)
+    //     .map(BufReader::new)
+    //     .map(noodles::vcf::io::Reader::new)?;
+    //
     let header = reader.read_header()?;
 
     //let mut breakpoints = Vec::<Breakpoint>::new();
