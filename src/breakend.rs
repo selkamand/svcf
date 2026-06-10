@@ -15,18 +15,71 @@ use std::{
     fmt,
 };
 
-// Note start and pos are 0-based & inclusive while end position is non-inclusive (e.g. a region 1000)
+/// A single structural-variant breakend parsed from a VCF record.
+///
+/// A breakend represents one side of a structural variant breakpoint. Paired
+/// breakends are linked by `mateid`. single breakends have no mate so mateid is set to NULL
+///
+/// Coordinates are BED-style:
+/// - `start` and `pos` are 0-based.
+/// - `end` is non-inclusive (1-based).
+/// - `start..end` represents the confidence interval around `pos`,
+///   derived from the VCF `CIPOS` INFO field.
+///
+/// Strand is inferred from the alt allele content
 pub struct Breakend {
-    chrom: String,
-    start: u64,
-    end: u64,
-    pos: u64,
-    id: String,
-    mateid: Option<String>,
-    strand: Strand,
-    qual: f32,
-    vaf: f32,
+    /// Reference sequence or contig name for this breakend, e.g. `"chr3"`.
+    pub chrom: String,
+
+    /// Start of the breakend confidence interval.
+    ///
+    /// This is a 0-based BED-style coordinate. It is derived from the VCF
+    /// 1-based `POS` field and the lower bound of the `CIPOS` INFO field.
+    pub start: u64,
+
+    /// End of the breakend confidence interval.
+    ///
+    /// This is a non-inclusive BED-style end coordinate. It is derived from the
+    /// VCF 1-based `POS` field and the upper bound of the `CIPOS` INFO field.
+    pub end: u64,
+
+    /// Representative breakend position.
+    ///
+    /// This is the VCF `POS` field converted from 1-based to 0-based
+    /// coordinates. Unlike [`Breakend::start`] and [`Breakend::end`], this is a
+    /// single representative position rather than an uncertainty interval.
+    pub pos: u64,
+
+    /// VCF `ID` for this breakend record.
+    ///
+    /// In paired GRIDSS/PURPLE-style VCFs, the mate breakend should refer to
+    /// this value in its `MATEID` INFO field.
+    pub id: String,
+
+    /// VCF `MATEID` for this breakend record.
+    ///
+    /// This is [`Some`] for paired breakends and [`None`] for single breakends
+    /// or records without a usable `MATEID`.
+    pub mateid: Option<String>,
+
+    /// Orientation of this breakend.
+    ///
+    /// This is inferred from the VCF ALT allele breakend notation.
+    pub strand: Strand,
+
+    /// VCF `QUAL` score for this breakend.
+    ///
+    /// Missing or unparsable quality scores may be represented as `NaN`,
+    /// depending on the parser configuration.
+    pub qual: f32,
+
+    /// Variant allele fraction for this breakend.
+    ///
+    /// This is parsed from the configured VAF INFO field, such as
+    /// `PURPLE_AF`.
+    pub vaf: f32,
 }
+
 impl std::fmt::Display for Breakend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -44,9 +97,14 @@ impl std::fmt::Display for Breakend {
         )
     }
 }
+
+/// A paired structural-variant breakpoint made from two mated breakends.
+///
+/// This is the unit that can be written to BEDPE: each row contains the two
+/// genomic intervals represented by `first` and `second`.
 pub struct Breakpoint {
-    first: Breakend,
-    second: Breakend,
+    pub first: Breakend,
+    pub second: Breakend,
 }
 
 impl Breakpoint {
@@ -78,7 +136,7 @@ impl Breakpoint {
     }
 }
 
-enum Strand {
+pub enum Strand {
     Plus,
     Minus,
 }
@@ -103,19 +161,27 @@ impl fmt::Debug for Strand {
 
 #[derive(Default)]
 pub struct BreakpointPairer {
-    pub pending_by_id: HashMap<String, Breakend>,
-    pub seen_ids: HashSet<String>,
-    pub breakpoints: Vec<Breakpoint>,
-    pub single_breakends: Vec<Breakend>,
+    pending_by_id: HashMap<String, Breakend>,
+    seen_ids: HashSet<String>,
+    breakpoints: Vec<Breakpoint>,
+    single_breakends: Vec<Breakend>,
 }
 
-// All structural variants
-// Breakpoints = Paired
-// Single Breakends = No MateID
-// Unmatched = had a MateID specified but mate not found in VCF
+/// Structural variants parsed from an SV VCF.
+///
+/// The parsed variants are split into three groups:
+/// - `breakpoints`: complete paired breakends that can be written to BEDPE.
+/// - `single_breakends`: breakends with no `MATEID`.
+/// - `unmatched_breakends`: breakends with a `MATEID` whose mate was not found,
+///   usually because the mate was filtered out or absent from the input VCF.
 pub struct StructuralVariants {
+    /// Complete paired breakpoints that can be written to BEDPE.
     pub breakpoints: Vec<Breakpoint>,
+
+    /// Breakends with no `MATEID`, representing single breakends.
     pub single_breakends: Vec<Breakend>,
+
+    /// Breakends with a `MATEID` whose mate was not found in the input VCF.
     pub unmatched_breakends: Vec<Breakend>,
 }
 
@@ -182,6 +248,17 @@ fn validate_reciprocal_mates(first: &Breakend, second: &Breakend) -> Result<()> 
 }
 
 impl StructuralVariants {
+    /// Writes paired breakpoints as a BEDPE-like TSV.
+    ///
+    /// The output contains one row per paired breakpoint. Single breakends and
+    /// unmatched breakends are intentionally excluded because they do not have
+    /// two complete genomic ends.
+    ///
+    /// The writer can be a file, stdout, or any other type implementing
+    /// [`std::io::Write`].
+    ///
+    /// # Errors
+    /// Returns an error if writing to the output stream fails.
     pub fn write_bedpe_tsv<W: Write>(&self, writer: W) -> Result<()> {
         let mut writer = csv::WriterBuilder::new()
             .delimiter(b'\t')
@@ -201,19 +278,34 @@ impl StructuralVariants {
         Ok(())
     }
 
+    /// Returns the number of complete paired breakpoints.
     pub fn n_breakpoints(&self) -> usize {
         self.breakpoints.len()
     }
-
+    /// Returns the number of single breakends without a mate ID.
     pub fn n_single_breakends(&self) -> usize {
         self.single_breakends.len()
     }
 
+    /// Returns the number of breakends whose declared mate was not found in VCF after filtering.
     pub fn n_unmatched_breakends(&self) -> usize {
         self.unmatched_breakends.len()
     }
 }
 
+/// Reads a GRIDSS/PURPLE-style SV VCF and converts it into structural variants.
+///
+/// Only PASS records are parsed. Each passing VCF record is converted into a
+/// [`Breakend`], and mated breakends are paired into [`Breakpoint`] values using
+/// their `ID` and `MATEID` fields.
+///
+/// `vaf_field` is the name of the INFO field containing purity adjusted variant allele
+/// frequency, for example `PURPLE_AF`.
+///
+/// # Errors
+///
+/// Returns an error if the VCF cannot be opened or parsed, if required fields
+/// are missing or malformed, or if breakend pairing encounters invalid IDs.
 pub fn vcf_to_structural_variants(vcf: &str, vaf_field: &str) -> Result<StructuralVariants> {
     let mut reader = File::open(vcf)
         .map(BufReader::new)
@@ -242,6 +334,18 @@ pub fn vcf_to_structural_variants(vcf: &str, vaf_field: &str) -> Result<Structur
     Ok(pairing)
 }
 
+/// Converts a single VCF record into a [`Breakend`].
+///
+/// This extracts the record ID, `MATEID`, position, `CIPOS`, VAF, QUAL,
+/// chromosome, ALT allele, and inferred breakend strand.
+///
+/// `vaf_field` is the INFO key used to read VAF, for example `PURPLE_AF`.
+///
+/// # Errors
+///
+/// Returns an error if required VCF fields are missing, if INFO fields have an
+/// unexpected type, if the ALT allele cannot be interpreted as a breakend, or if
+/// the record has multiple ALT alleles.
 pub fn record_to_breakend(
     record: &vcf::Record,
     header: &vcf::Header,
