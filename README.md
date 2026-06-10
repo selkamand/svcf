@@ -7,7 +7,9 @@ Converts a single sample somatic structural variant VCF file (from gridss/purple
 
 ## Installation
 
-Compile development version from source using:
+Binaries and installation scripts are available in [releases](https://github.com/selkamand/svcf/releases/)
+
+Or to compile development version from source run:
 
 ```
 cargo install --git https://github.com/selkamand/svcf
