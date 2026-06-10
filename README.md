@@ -5,6 +5,14 @@
 
 Converts a single sample somatic structural variant VCF file (from gridss/purple) to other file formats. 
 
+## Installation
+
+Compile development version from source using:
+
+```
+cargo install --git https://github.com/selkamand/svcf
+```
+
 ## Target Formats 
 
 ### BEDPE
