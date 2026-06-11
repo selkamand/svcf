@@ -8,8 +8,6 @@ use noodles::vcf::variant::record::Filters;
 use noodles::vcf::variant::record::Ids;
 use noodles::vcf::variant::record::info::field;
 use noodles::vcf::variant::record::info::field::value::Array;
-use std::fs::File;
-use std::io::BufReader;
 use std::io::Write;
 use std::{
     collections::{HashMap, HashSet},
