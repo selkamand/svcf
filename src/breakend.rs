@@ -107,7 +107,7 @@ pub struct Breakpoint {
 }
 
 impl Breakpoint {
-    fn write_bedpe_record<W: Write>(&self, writer: &mut csv::Writer<W>) -> Result<()> {
+    pub fn write_bedpe_record<W: Write>(&self, writer: &mut csv::Writer<W>) -> Result<()> {
         writer
             .write_record([
                 self.first.chrom.as_str(),
