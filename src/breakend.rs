@@ -1,6 +1,3 @@
-use anyhow::Context;
-use anyhow::Result;
-use anyhow::bail;
 use noodles::vcf;
 use noodles::vcf::io::CompressionMethod;
 use noodles::vcf::variant::record::AlternateBases;
@@ -13,6 +10,9 @@ use std::{
     collections::{HashMap, HashSet},
     fmt,
 };
+
+use crate::error::Error;
+use crate::error::Result;
 
 /// A single structural-variant breakend parsed from a VCF record.
 ///
@@ -108,20 +108,22 @@ pub struct Breakpoint {
 
 impl Breakpoint {
     fn write_bedpe_record<W: Write>(&self, writer: &mut csv::Writer<W>) -> Result<()> {
-        writer.write_record([
-            self.first.chrom.as_str(),
-            &self.first.start.to_string(),
-            &self.first.end.to_string(),
-            self.second.chrom.as_str(),
-            &self.second.start.to_string(),
-            &self.second.end.to_string(),
-            &self.id(),
-            &self.qual().to_string(),
-            &self.first.strand.to_string(),
-            &self.second.strand.to_string(),
-            &self.first.vaf.to_string(),
-            &self.second.vaf.to_string(),
-        ])?;
+        writer
+            .write_record([
+                self.first.chrom.as_str(),
+                &self.first.start.to_string(),
+                &self.first.end.to_string(),
+                self.second.chrom.as_str(),
+                &self.second.start.to_string(),
+                &self.second.end.to_string(),
+                &self.id(),
+                &self.qual().to_string(),
+                &self.first.strand.to_string(),
+                &self.second.strand.to_string(),
+                &self.first.vaf.to_string(),
+                &self.second.vaf.to_string(),
+            ])
+            .map_err(Error::WriteBedpe)?;
 
         Ok(())
     }
@@ -189,7 +191,9 @@ impl BreakpointPairer {
         let id = breakend.id.clone();
 
         if !self.seen_ids.insert(id.clone()) {
-            bail!("duplicate breakend ID found in VCF: {id}");
+            return Err(Error::InvalidPairing(format!(
+                "duplicate breakend ID found in VCF: {id}"
+            )));
         }
 
         let Some(mate_id) = breakend.mateid.clone() else {
@@ -198,7 +202,9 @@ impl BreakpointPairer {
         };
 
         if mate_id == id {
-            bail!("breakend {id} has itself as MATEID");
+            return Err(Error::InvalidPairing(format!(
+                "breakend {id} has itself as MATEID"
+            )));
         }
 
         if let Some(mate) = self.pending_by_id.remove(&mate_id) {
@@ -226,21 +232,17 @@ impl BreakpointPairer {
 
 fn validate_reciprocal_mates(first: &Breakend, second: &Breakend) -> Result<()> {
     if first.mateid.as_deref() != Some(second.id.as_str()) {
-        bail!(
+        return Err(Error::InvalidPairing(format!(
             "non-reciprocal MATEID: breakend {} has mateid {:?}, but expected {}",
-            first.id,
-            first.mateid,
-            second.id
-        );
+            first.id, first.mateid, second.id
+        )));
     }
 
     if second.mateid.as_deref() != Some(first.id.as_str()) {
-        bail!(
+        return Err(Error::InvalidPairing(format!(
             "non-reciprocal MATEID: breakend {} has mateid {:?}, but expected {}",
-            second.id,
-            second.mateid,
-            first.id
-        );
+            second.id, second.mateid, first.id
+        )));
     }
 
     Ok(())
@@ -263,16 +265,18 @@ impl StructuralVariants {
             .delimiter(b'\t')
             .from_writer(writer);
 
-        writer.write_record([
-            "chrom1", "start1", "end1", "chrom2", "start2", "end2", "name", "score", "strand1",
-            "strand2", "vaf1", "vaf2",
-        ])?;
+        writer
+            .write_record([
+                "chrom1", "start1", "end1", "chrom2", "start2", "end2", "name", "score", "strand1",
+                "strand2", "vaf1", "vaf2",
+            ])
+            .map_err(Error::WriteBedpe)?;
 
         for breakpoint in &self.breakpoints {
             breakpoint.write_bedpe_record(&mut writer)?;
         }
 
-        writer.flush()?;
+        writer.flush().map_err(Error::FlushBedpe)?;
 
         Ok(())
     }
@@ -313,23 +317,39 @@ pub fn vcf_to_structural_variants(vcf: &str, vaf_field: &str) -> Result<Structur
     let mut reader = vcf::io::reader::Builder::default()
         .set_compression_method(compression_method)
         .build_from_path(vcf)
-        .context("Failed to read vcf")?;
+        .map_err(|source| Error::ReadVcf {
+            path: vcf.to_string(),
+            source,
+        })?;
 
     // let mut reader = File::open(vcf)
     //     .map(BufReader::new)
     //     .map(noodles::vcf::io::Reader::new)?;
     //
-    let header = reader.read_header()?;
+    let header = reader.read_header().map_err(|source| Error::ReadVcf {
+        path: vcf.to_string(),
+        source,
+    })?;
 
     //let mut breakpoints = Vec::<Breakpoint>::new();
     let mut pairer = BreakpointPairer::default();
 
     // Iterate through VCF record
     for result in reader.records() {
-        let record = result?; // Skip non-pass records
+        let record = result.map_err(|source| Error::ParseVcfRecord {
+            path: vcf.to_string(),
+            source,
+        })?;
 
         // Skip non-pass variants
-        if !record.filters().is_pass(&header)? {
+        if !record
+            .filters()
+            .is_pass(&header)
+            .map_err(|source| Error::FilterStatus {
+                record_id: parse_id(&record).unwrap_or_else(|_| "<unknown>".to_string()),
+                source,
+            })?
+        {
             continue;
         }
 
@@ -364,15 +384,30 @@ pub fn record_to_breakend(
     let breakend_id = parse_id(record)?;
 
     // Fetch MATEID (if none: Single breakend
-    let mateid = parse_mate_id(record, header).context(format!("Variant ID: {breakend_id}"))?;
+    let mateid = parse_mate_id(record, header).map_err(|error| {
+        Error::invalid_variant_record(
+            breakend_id.clone(),
+            format!("failed to parse MATEID: {error}"),
+        )
+    })?;
 
     // Grab Position
     let Some(pos_res) = record.variant_start() else {
-        bail! {
-            "Failed to get position in row for variant: {breakend_id:#?}",
-        }
+        return Err(Error::invalid_variant_record(
+            breakend_id.clone(),
+            "failed to get position",
+        ));
     };
-    let pos_usize = pos_res?.get(); // 1-based position
+
+    let pos_usize = pos_res
+        .map_err(|error| {
+            Error::invalid_variant_record(
+                breakend_id.clone(),
+                format!("failed to parse position: {error}"),
+            )
+        })?
+        .get();
+
     let pos_1based: u64 = pos_usize.try_into()?; // Convert to u64
     let pos: u64 = pos_1based.saturating_sub(1); // Convert to 0-based position
 
@@ -392,7 +427,9 @@ pub fn record_to_breakend(
     let end = pos_1based.saturating_add(cipos_high);
 
     // Grab VAF
-    let vaf = parse_vaf(record, header, vaf_field).context(format!("Variant: {breakend_id}"))?;
+    let vaf = parse_vaf(record, header, vaf_field).map_err(|error| {
+        Error::invalid_variant_record(breakend_id.clone(), format!("failed to parse VAF: {error}"))
+    })?;
 
     // Grab QUAL  (or NAN if anything went wrong)
     let qual = record
@@ -406,13 +443,20 @@ pub fn record_to_breakend(
     // Grab ALT (used to infer strand)
     let altbases = record.alternate_bases();
     if altbases.len() != 1 {
-        bail!(
-            "Expected a single alternative sequece for variant {breakend_id} but found {}",
-            altbases.len()
-        )
+        return Err(Error::invalid_variant_record(
+            breakend_id.clone(),
+            format!(
+                "expected a single alternative sequence but found {}",
+                altbases.len()
+            ),
+        ));
     }
-    let alt = get_first_alt_as_string(record)
-        .context("Failed to pull a valid alternative sequence for variant {breakend_id}")?;
+    let alt = get_first_alt_as_string(record).ok_or_else(|| {
+        Error::invalid_variant_record(
+            breakend_id.clone(),
+            "failed to pull a valid alternative sequence",
+        )
+    })?;
 
     // Infer strand from alt sequence Grab strand
     let strand = alt_to_strand(alt)?;
@@ -439,7 +483,10 @@ fn parse_mate_id(record: &vcf::Record, header: &vcf::Header) -> Result<Option<St
         return Ok(None);
     };
 
-    let Some(value) = value_result? else {
+    let Some(value) = value_result.map_err(|error| {
+        Error::invalid_info("MATEID", format!("failed to parse field: {error}"))
+    })?
+    else {
         return Ok(None);
     };
 
@@ -449,11 +496,12 @@ fn parse_mate_id(record: &vcf::Record, header: &vcf::Header) -> Result<Option<St
         field::Value::Character(c) => c.to_string(),
         field::Value::String(s) => s.to_string(),
         field::Value::Flag => {
-            anyhow::bail!("MATEID field is a flag type, which can not be coerced to a string")
+            return Err(Error::invalid_info(
+                "MATEID",
+                "field is a flag type, which cannot be coerced to a string",
+            ));
         }
-        field::Value::Array(arr) => {
-            parse_one_string_from_array(arr, mateid_key).context("Failed to extract MATEID")?
-        }
+        field::Value::Array(arr) => parse_one_string_from_array(arr, mateid_key)?,
     };
 
     if mate_id == "." {
@@ -466,164 +514,174 @@ fn parse_mate_id(record: &vcf::Record, header: &vcf::Header) -> Result<Option<St
 // Get stock standard ID column from VCF
 fn parse_id(record: &vcf::Record) -> Result<String> {
     let ids = record.ids();
+
     if ids.len() > 1 {
-        bail!(
-            "Multiple IDs found in a single ID column of SV vcf. This is unexpected and should be resolved before converting to BEDPE"
-        )
+        return Err(Error::invalid_record(
+            "multiple IDs found in a single ID column of SV VCF",
+        ));
     }
+
     if ids.len() == 0 {
-        bail!(
-            "Some SV entries lack any value in the ID column. This is unexpected and should be resolved before converting to BEDPE"
-        )
+        return Err(Error::invalid_record(
+            "SV entry lacks a value in the ID column",
+        ));
     }
-    // Get first ID
+
     let Some(id_str) = ids.iter().next() else {
-        bail!(
-            "At least one SV entry lacks a value in the ID column. This is unexpected and should be resolved before converting to BEDPE"
-        )
+        return Err(Error::invalid_record(
+            "SV entry lacks a value in the ID column",
+        ));
     };
 
     let id = id_str.to_owned();
 
     if id == "." {
-        bail!(
-            "At least one SV entry lacks a value in the ID column. This is unexpected and should be resolved before converting to BEDPE"
-        )
-    } else {
-        Ok(id)
+        return Err(Error::invalid_record("SV entry has missing ID value '.'"));
     }
+
+    Ok(id)
 }
 
 fn parse_cipos(record: &vcf::Record, header: &vcf::Header) -> Result<(i32, i32)> {
     let info = record.info();
 
     let Some(value_result) = info.get(header, "CIPOS") else {
-        bail!("Can not find CIPOS field")
+        return Err(Error::invalid_info("CIPOS", "field not found"));
     };
 
-    let Some(value) = value_result? else {
-        bail!("Can not find CIPOS field")
+    let Some(value) = value_result
+        .map_err(|error| Error::invalid_info("CIPOS", format!("failed to parse field: {error}")))?
+    else {
+        return Err(Error::invalid_info("CIPOS", "field has no value"));
     };
 
     let array = match value {
         field::Value::Array(array) => array,
-        _ => bail!("INFO/CIPOS expected an array, got {value:#?}"),
+        _ => {
+            return Err(Error::invalid_info(
+                "CIPOS",
+                format!("expected array, got {value:#?}"),
+            ));
+        }
     };
 
     let array_int = match array {
         field::value::Array::Integer(values) => values,
-        _ => bail!("INFO/CIPOS expected to be an integer array, got {array:#?}"),
+        _ => {
+            return Err(Error::invalid_info(
+                "CIPOS",
+                format!("expected integer array, got {array:#?}"),
+            ));
+        }
     };
 
     if array_int.len() != 2 {
-        bail!(
-            "INFO/CIPOS should contain 2 numbers per entry, found {}",
-            array_int.len()
-        )
+        return Err(Error::invalid_info(
+            "CIPOS",
+            format!("expected 2 numbers, found {}", array_int.len()),
+        ));
     }
 
-    // Grab the first two elements of the array
     let mut iter = array_int.iter();
 
-    let lo_option = iter
+    let lo = iter
         .next()
-        .transpose()?
-        .context("INFO/CIPOS expected first integer value")?;
+        .ok_or_else(|| Error::invalid_info("CIPOS", "expected first integer value"))?
+        .map_err(|error| {
+            Error::invalid_info("CIPOS", format!("failed to parse first value: {error}"))
+        })?
+        .ok_or_else(|| Error::invalid_info("CIPOS", "first integer value is missing"))?;
 
-    let hi_option = iter
+    let hi = iter
         .next()
-        .transpose()?
-        .context("INFO/CIPOS expected second integer value")?;
-
-    let Some(lo) = lo_option else {
-        bail!("INFO/CIPOS expected first integer value");
-    };
-    let Some(hi) = hi_option else {
-        bail!("INFO/CIPOS expected second integer value");
-    };
+        .ok_or_else(|| Error::invalid_info("CIPOS", "expected second integer value"))?
+        .map_err(|error| {
+            Error::invalid_info("CIPOS", format!("failed to parse second value: {error}"))
+        })?
+        .ok_or_else(|| Error::invalid_info("CIPOS", "second integer value is missing"))?;
 
     Ok((lo, hi))
 }
 
 fn parse_vaf(record: &vcf::Record, header: &vcf::Header, vaf_field: &str) -> Result<f32> {
-    // Keep this binding, otherwise record.info() may be a temporary that gets dropped.
     let info = record.info();
 
     let Some(value_result) = info.get(header, vaf_field) else {
-        bail!("cannot find INFO/{vaf_field} field");
+        return Err(Error::invalid_info(vaf_field, "field not found"));
     };
 
-    let Some(value) = value_result? else {
-        bail!("INFO/{vaf_field} is present but has no value");
+    let Some(value) = value_result.map_err(|error| {
+        Error::invalid_info(vaf_field, format!("failed to parse field: {error}"))
+    })?
+    else {
+        return Err(Error::invalid_info(
+            vaf_field,
+            "field is present but has no value",
+        ));
     };
 
     match value {
-        // This may happen if the header or parser treats it as a scalar.
         field::Value::Float(vaf) => Ok(vaf),
-
-        // This is the likely case for Number=.
         field::Value::Array(array) => parse_first_float_from_array(array, vaf_field),
-
-        field::Value::Integer(_) => {
-            bail!("INFO/{vaf_field} expected Float, got Integer")
-        }
-
-        field::Value::Flag => {
-            bail!("INFO/{vaf_field} expected Float, got Flag")
-        }
-
-        field::Value::Character(_) => {
-            bail!("INFO/{vaf_field} expected Float, got Character")
-        }
-
+        field::Value::Integer(_) => Err(Error::invalid_info(
+            vaf_field,
+            "expected Float, got Integer",
+        )),
+        field::Value::Flag => Err(Error::invalid_info(vaf_field, "expected Float, got Flag")),
+        field::Value::Character(_) => Err(Error::invalid_info(
+            vaf_field,
+            "expected Float, got Character",
+        )),
         field::Value::String(_) => {
-            bail!("INFO/{vaf_field} expected Float, got String")
+            Err(Error::invalid_info(vaf_field, "expected Float, got String"))
         }
     }
 }
-
 fn parse_first_float_from_array(array: Array<'_>, field_name: &str) -> Result<f32> {
     let Array::Float(values) = array else {
-        bail!("INFO/{field_name} expected a Float array");
+        return Err(Error::invalid_info(field_name, "expected a Float array"));
     };
-
-    // if values.len() != 1 {
-    //     bail!(
-    //         "INFO/{field_name} expected exactly one float value, got {}",
-    //         values.len()
-    //     );
-    // }
 
     let mut iter = values.iter();
 
-    let vaf = iter
+    let value_result = iter
         .next()
-        .context(format!("INFO/{field_name} expected one float value"))??
-        .context(format!("INFO/{field_name} contains a missing float value"))?;
+        .ok_or_else(|| Error::invalid_info(field_name, "expected one float value"))?;
 
-    Ok(vaf)
+    let value = value_result
+        .map_err(|error| {
+            Error::invalid_info(field_name, format!("failed to parse float value: {error}"))
+        })?
+        .ok_or_else(|| Error::invalid_info(field_name, "contains a missing float value"))?;
+
+    Ok(value)
 }
 
 fn parse_one_string_from_array(array: Array<'_>, field_name: &str) -> Result<String> {
     let Array::String(values) = array else {
-        bail!("INFO/{field_name} expected a String array");
+        return Err(Error::invalid_info(field_name, "expected a String array"));
     };
 
     if values.len() != 1 {
-        bail!(
-            "INFO/{field_name} expected exactly one string value, got {}",
-            values.len()
-        );
+        return Err(Error::invalid_info(
+            field_name,
+            format!("expected exactly one string value, got {}", values.len()),
+        ));
     }
 
     let mut iter = values.iter();
 
-    let vaf = iter
+    let value_result = iter
         .next()
-        .context(format!("INFO/{field_name} expected one string value"))??
-        .context(format!("INFO/{field_name} contains a missing string value"))?;
+        .ok_or_else(|| Error::invalid_info(field_name, "expected one string value"))?;
 
-    Ok(vaf.to_string())
+    let value = value_result
+        .map_err(|error| {
+            Error::invalid_info(field_name, format!("failed to parse string value: {error}"))
+        })?
+        .ok_or_else(|| Error::invalid_info(field_name, "contains a missing string value"))?;
+
+    Ok(value.to_string())
 }
 
 // ALT pattern             local breakend strand
@@ -634,6 +692,7 @@ fn parse_one_string_from_array(array: Array<'_>, field_name: &str) -> Result<Str
 // [chr:pos[s              -
 // s.                      +
 // .s                      -
+
 fn alt_to_strand(alt: String) -> Result<Strand> {
     if alt.ends_with('[') {
         return Ok(Strand::Plus);
@@ -659,7 +718,7 @@ fn alt_to_strand(alt: String) -> Result<Strand> {
         return Ok(Strand::Minus);
     }
 
-    bail!("Failed to infer strand from ALT sequence: {alt}")
+    Err(Error::InvalidAlt { alt })
 }
 
 // Get first alternate base as string. If anything goes wrong or alt is empty return None
@@ -679,34 +738,38 @@ pub fn write_bedpe_tsv<W: Write>(writer: W, breakpoints: &[Breakpoint]) -> Resul
     let mut writer = csv::WriterBuilder::new()
         .delimiter(b'\t')
         .from_writer(writer);
-
-    writer.write_record([
-        "chrom1", "start1", "end1", "chrom2", "start2", "end2", "id", "qual", "strand1", "strand2",
-    ])?;
+    writer
+        .write_record([
+            "chrom1", "start1", "end1", "chrom2", "start2", "end2", "id", "qual", "strand1",
+            "strand2",
+        ])
+        .map_err(Error::WriteBedpe)?;
 
     for breakpoint in breakpoints {
         //let svclass = infer_svclass(breakpoint);
 
-        writer.write_record([
-            breakpoint.first.chrom.as_str(),
-            &breakpoint.first.start.to_string(),
-            &breakpoint.first.end.to_string(),
-            breakpoint.second.chrom.as_str(),
-            &breakpoint.second.start.to_string(),
-            &breakpoint.second.end.to_string(),
-            &format!(
-                "{}.{}",
-                breakpoint.first.id.as_str(),
-                breakpoint.second.id.as_str()
-            ),
-            &breakpoint.first.qual.to_string(),
-            &breakpoint.first.strand.to_string(),
-            &breakpoint.second.strand.to_string(),
-            // svclass,
-        ])?;
+        writer
+            .write_record([
+                breakpoint.first.chrom.as_str(),
+                &breakpoint.first.start.to_string(),
+                &breakpoint.first.end.to_string(),
+                breakpoint.second.chrom.as_str(),
+                &breakpoint.second.start.to_string(),
+                &breakpoint.second.end.to_string(),
+                &format!(
+                    "{}.{}",
+                    breakpoint.first.id.as_str(),
+                    breakpoint.second.id.as_str()
+                ),
+                &breakpoint.first.qual.to_string(),
+                &breakpoint.first.strand.to_string(),
+                &breakpoint.second.strand.to_string(),
+                // svclass,
+            ])
+            .map_err(Error::WriteBedpe)?;
     }
 
-    writer.flush()?;
+    writer.flush().map_err(Error::FlushBedpe)?;
 
     Ok(())
 }
